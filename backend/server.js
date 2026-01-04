@@ -2,7 +2,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
-import createMollieClient from "@mollie/api-client";
+import { createMollieClient } from "@mollie/api-client";
 import admin from "firebase-admin";
 
 const app = express();
