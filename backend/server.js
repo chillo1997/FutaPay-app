@@ -222,7 +222,7 @@ app.get("/health", (req, res) => {
 
 app.get("/pawapay/active-conf", async (req, res) => {
   if (!requirePawaPayToken(res)) return;
-  const result = await pawaPayFetch("/active-configuration", { method: "GET" });
+  const result = await pawaPayFetch("/v2/active-configuration", { method: "GET" });
   safeJson(res, result.ok ? 200 : result.status, result);
 });
 
@@ -303,7 +303,8 @@ app.post("/pawapay/payouts", async (req, res) => {
     customerMessage,
   };
 
-  const result = await pawaPayFetch("/payouts", { method: "POST", body: payload });
+  const result = await pawaPayFetch("/v2/payouts", { method: "POST", body: payload });
+
 
   store.payouts.set(payoutId, {
     payoutId,
