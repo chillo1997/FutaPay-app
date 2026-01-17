@@ -1,3 +1,4 @@
+// server.js
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -7,21 +8,30 @@ import admin from "firebase-admin";
 
 const app = express();
 
-// Mollie webhooks often POST as x-www-form-urlencoded, so accept both:
+/* --------------------------
+   Middleware
+-------------------------- */
 app.use(cors());
+// Mollie webhooks often POST as x-www-form-urlencoded, so accept both:
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json({ limit: "1mb" }));
+
+/* --------------------------
+   Basics
+-------------------------- */
+const PORT = process.env.PORT || 10000;
+
 app.get("/version", (req, res) => {
-  res.json({ ok: true, version: "mollie-v1", ts: new Date().toISOString() });
+  res.json({ ok: true, version: "server-v1", ts: new Date().toISOString() });
 });
 
-
-const PORT = process.env.PORT || 10000;
+app.get("/health", (req, res) => {
+  res.json({ ok: true, service: "futapay-backend", ts: new Date().toISOString() });
+});
 
 /* --------------------------
    Firebase Admin (Backend)
 -------------------------- */
-
 function initFirebaseAdmin() {
   if (admin.apps.length) return;
 
@@ -52,7 +62,6 @@ function firestore() {
 /* --------------------------
    Mollie
 -------------------------- */
-
 const MOLLIE_API_KEY = process.env.MOLLIE_API_KEY || "";
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://futapay-app1.onrender.com";
 
@@ -167,9 +176,8 @@ app.get("/mollie/return", (req, res) => {
 });
 
 /* --------------------------
-   pawaPay (your existing)
+   pawaPay
 -------------------------- */
-
 const PAWAPAY_BASE_URL = process.env.PAWAPAY_BASE_URL || "https://api.sandbox.pawapay.io";
 const PAWAPAY_TOKEN = (process.env.PAWAPAY_TOKEN || "").trim();
 const PAWAPAY_RETURN_URL =
@@ -190,8 +198,10 @@ function requirePawaPayToken(res) {
 async function pawaPayFetch(path, { method = "GET", body } = {}) {
   const url = `${PAWAPAY_BASE_URL}${path}`;
 
-  const headers = { Authorization: `Bearer ${PAWAPAY_TOKEN}` };
-  Accept: "application/json";
+  const headers = {
+    Authorization: `Bearer ${PAWAPAY_TOKEN}`,
+    Accept: "application/json",
+  };
   if (body) headers["Content-Type"] = "application/json";
 
   const r = await fetch(url, {
@@ -215,18 +225,35 @@ function safeJson(res, status, payload) {
   res.status(status).json(payload);
 }
 
-const store = { deposits: new Map(), payouts: new Map() };
+/**
+ * Optional: see what pawaPay thinks is available (often useful in sandbox).
+ * Example:
+ * /pawapay/availability?country=ZMB&operationType=PAYOUT
+ */
+app.get("/pawapay/availability", async (req, res) => {
+  if (!requirePawaPayToken(res)) return;
 
-app.get("/health", (req, res) => {
-  res.json({ ok: true, service: "futapay-backend", ts: new Date().toISOString() });
+  const country = req.query.country || "ZMB";
+  const operationType = req.query.operationType || "PAYOUT";
+
+  const result = await pawaPayFetch(
+    `/v2/availability?country=${encodeURIComponent(country)}&operationType=${encodeURIComponent(
+      operationType
+    )}`,
+    { method: "GET" }
+  );
+
+  safeJson(res, result.ok ? 200 : result.status, result);
 });
 
+// Active configuration
 app.get("/pawapay/active-conf", async (req, res) => {
   if (!requirePawaPayToken(res)) return;
   const result = await pawaPayFetch("/v2/active-configuration", { method: "GET" });
   safeJson(res, result.ok ? 200 : result.status, result);
 });
 
+// Payment page deposit (if you use it)
 app.post("/pawapay/paymentpage/deposit", async (req, res) => {
   if (!requirePawaPayToken(res)) return;
 
@@ -236,21 +263,6 @@ app.post("/pawapay/paymentpage/deposit", async (req, res) => {
   if (!amount || !phoneNumber) {
     return safeJson(res, 400, { ok: false, error: "Missing required fields: amount, phoneNumber" });
   }
-
-  app.get("/pawapay/availability", async (req, res) => {
-  if (!requirePawaPayToken(res)) return;
-
-  const country = req.query.country || "ZMB";
-  const operationType = req.query.operationType || "PAYOUT";
-
-  const result = await pawaPayFetch(
-    `/v2/availability?country=${encodeURIComponent(country)}&operationType=${encodeURIComponent(operationType)}`,
-    { method: "GET" }
-  );
-
-  safeJson(res, result.ok ? 200 : result.status, result);
-});
-
 
   const depositId = crypto.randomUUID();
 
@@ -265,16 +277,12 @@ app.post("/pawapay/paymentpage/deposit", async (req, res) => {
 
   const result = await pawaPayFetch("/payment-page/deposits", { method: "POST", body: payload });
 
-  store.deposits.set(depositId, {
-    depositId,
-    createdAt: new Date().toISOString(),
-    request: payload,
-    response: result.data,
-    status: "PENDING",
-  });
-
   if (!result.ok) {
-    return safeJson(res, result.status, { ok: false, error: "pawaPay deposit creation failed", details: result.data });
+    return safeJson(res, result.status, {
+      ok: false,
+      error: "pawaPay deposit creation failed",
+      details: result.data,
+    });
   }
 
   const redirectUrl =
@@ -286,6 +294,7 @@ app.post("/pawapay/paymentpage/deposit", async (req, res) => {
   return safeJson(res, 200, { ok: true, depositId, redirectUrl, raw: result.data });
 });
 
+// Return page for payment page deposits
 app.get("/pawapay/return", (req, res) => {
   res.setHeader("Content-Type", "text/html");
   res.end(`
@@ -296,6 +305,7 @@ app.get("/pawapay/return", (req, res) => {
   `);
 });
 
+// Payout request
 app.post("/pawapay/payouts", async (req, res) => {
   if (!requirePawaPayToken(res)) return;
 
@@ -303,7 +313,10 @@ app.post("/pawapay/payouts", async (req, res) => {
     req.body || {};
 
   if (!provider || !phoneNumber || !amount) {
-    return safeJson(res, 400, { ok: false, error: "Missing required fields: provider, phoneNumber, amount" });
+    return safeJson(res, 400, {
+      ok: false,
+      error: "Missing required fields: provider, phoneNumber, amount",
+    });
   }
 
   const payoutId = crypto.randomUUID();
@@ -321,28 +334,29 @@ app.post("/pawapay/payouts", async (req, res) => {
 
   const result = await pawaPayFetch("/v2/payouts", { method: "POST", body: payload });
 
-
-  store.payouts.set(payoutId, {
-    payoutId,
-    createdAt: new Date().toISOString(),
-    request: payload,
-    response: result.data,
-    status: "PENDING",
-  });
-
   if (!result.ok) {
-    return safeJson(res, result.status, { ok: false, error: "pawaPay payout creation failed", details: result.data });
+    return safeJson(res, result.status, {
+      ok: false,
+      error: "pawaPay payout creation failed",
+      details: result.data,
+    });
   }
 
   return safeJson(res, 200, { ok: true, payoutId, raw: result.data });
 });
 
-app.get("/debug/store", (req, res) => {
-  res.json({
-    ok: true,
-    deposits: Array.from(store.deposits.values()),
-    payouts: Array.from(store.payouts.values()),
-  });
+/* --------------------------
+   pawaPay callbacks
+-------------------------- */
+// Quick browser check that the webhook URL is reachable:
+app.get("/webhooks/pawapay", (req, res) => {
+  res.json({ ok: true, message: "pawaPay webhook endpoint is reachable" });
+});
+
+// Callback receiver:
+app.post("/webhooks/pawapay", (req, res) => {
+  console.log("✅ pawaPay callback received:", JSON.stringify(req.body));
+  return res.status(200).send("ok");
 });
 
 app.listen(PORT, () => {
