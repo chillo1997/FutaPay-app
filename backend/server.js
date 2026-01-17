@@ -171,7 +171,7 @@ app.get("/mollie/return", (req, res) => {
 -------------------------- */
 
 const PAWAPAY_BASE_URL = process.env.PAWAPAY_BASE_URL || "https://api.sandbox.pawapay.io";
-const PAWAPAY_TOKEN = process.env.PAWAPAY_TOKEN || "";
+const PAWAPAY_TOKEN = (process.env.PAWAPAY_TOKEN || "").trim();
 const PAWAPAY_RETURN_URL =
   process.env.PAWAPAY_RETURN_URL ||
   (PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}/pawapay/return` : "https://example.com");
@@ -191,6 +191,7 @@ async function pawaPayFetch(path, { method = "GET", body } = {}) {
   const url = `${PAWAPAY_BASE_URL}${path}`;
 
   const headers = { Authorization: `Bearer ${PAWAPAY_TOKEN}` };
+  Accept: "application/json";
   if (body) headers["Content-Type"] = "application/json";
 
   const r = await fetch(url, {
