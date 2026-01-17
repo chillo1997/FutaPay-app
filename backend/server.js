@@ -309,14 +309,22 @@ app.get("/pawapay/return", (req, res) => {
 app.post("/pawapay/payouts", async (req, res) => {
   if (!requirePawaPayToken(res)) return;
 
-  const { provider, phoneNumber, amount, currency = "ZMW", customerMessage = "FutaPay payout test" } =
-    req.body || {};
+  const {
+    uid,
+    txId,
+    provider,
+    phoneNumber,
+    amount,
+    currency = "ZMW",
+    customerMessage = "FutaPay payout test",
+  } = req.body || {};
+
+  if (!uid || !txId) {
+    return safeJson(res, 400, { ok: false, error: "Missing required fields: uid, txId" });
+  }
 
   if (!provider || !phoneNumber || !amount) {
-    return safeJson(res, 400, {
-      ok: false,
-      error: "Missing required fields: provider, phoneNumber, amount",
-    });
+    return safeJson(res, 400, { ok: false, error: "Missing required fields: provider, phoneNumber, amount" });
   }
 
   const payoutId = crypto.randomUUID();
@@ -334,34 +342,112 @@ app.post("/pawapay/payouts", async (req, res) => {
 
   const result = await pawaPayFetch("/v2/payouts", { method: "POST", body: payload });
 
+  // Store request + response in Firestore (so we can track it later)
+  const txRef = firestore().doc(`users/${uid}/transactions/${txId}`);
+
+  // Always store the payoutId even if pawaPay errors, for debugging
+  await txRef.set(
+    {
+      pawaPay: {
+        payoutId,
+        request: payload,
+        lastResponse: result.data,
+        lastHttpStatus: result.status,
+        status: result.ok ? (result.data?.status || "ACCEPTED") : "REQUEST_FAILED",
+      },
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
   if (!result.ok) {
     return safeJson(res, result.status, {
       ok: false,
       error: "pawaPay payout creation failed",
       details: result.data,
+      payoutId, // useful for support/debug
     });
   }
 
   return safeJson(res, 200, { ok: true, payoutId, raw: result.data });
 });
 
+
 /* --------------------------
    pawaPay callbacks
 -------------------------- */
 // Quick browser check that the webhook URL is reachable:
-app.get("/webhooks/pawapay", (req, res) => {
-  res.json({ ok: true, message: "pawaPay webhook endpoint is reachable" });
+function mapPawaPayStatusToInternal(status) {
+  const s = String(status || "").toUpperCase();
+
+  if (["ACCEPTED", "ENQUEUED", "PENDING", "PROCESSING"].includes(s)) return "payout_processing";
+  if (["COMPLETED", "SUCCESSFUL", "SUCCESS"].includes(s)) return "payout_completed";
+  if (["FAILED", "REJECTED", "CANCELLED", "CANCELED", "EXPIRED"].includes(s)) return "payout_failed";
+
+  return "payout_unknown";
+}
+
+app.post("/webhooks/pawapay", async (req, res) => {
+  try {
+    const event = req.body || {};
+
+    // Try multiple possible shapes
+    const payoutId =
+      event?.payoutId ||
+      event?.payoutID ||
+      event?.payout?.payoutId ||
+      event?.payout?.payoutID;
+
+    const status =
+      event?.status ||
+      event?.payoutStatus ||
+      event?.payout?.status ||
+      event?.payout?.payoutStatus;
+
+    console.log("✅ pawaPay callback received:", JSON.stringify(event));
+
+    // Always ACK quickly
+    if (!payoutId || !status) return res.status(200).send("ok");
+
+    const internal = mapPawaPayStatusToInternal(status);
+
+    // Find matching transaction across users
+    // Requires: you stored pawaPay.payoutId in transaction doc when creating payout
+    const snap = await firestore()
+      .collectionGroup("transactions")
+      .where("pawaPay.payoutId", "==", String(payoutId))
+      .limit(5)
+      .get();
+
+    if (snap.empty) {
+      console.log("⚠️ No transaction found for payoutId:", payoutId);
+      return res.status(200).send("ok");
+    }
+
+    const batch = firestore().batch();
+    for (const doc of snap.docs) {
+      batch.set(
+        doc.ref,
+        {
+          status: internal, // your app-level status
+          pawaPay: {
+            ...(doc.data()?.pawaPay || {}),
+            status: String(status),
+            lastCallback: event,
+            callbackReceivedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+
+    await batch.commit();
+    return res.status(200).send("ok");
+  } catch (err) {
+    console.log("❌ pawaPay webhook error:", err?.message || String(err));
+    // Still ACK so pawaPay doesn't keep retrying forever
+    return res.status(200).send("ok");
+  }
 });
 
-// Callback receiver:
-app.post("/webhooks/pawapay", (req, res) => {
-  console.log("✅ pawaPay callback received:", JSON.stringify(req.body));
-  return res.status(200).send("ok");
-});
-
-app.listen(PORT, () => {
-  console.log(`✅ Backend running on port ${PORT}`);
-  console.log(`PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}`);
-  console.log(`Mollie configured: ${Boolean(MOLLIE_API_KEY)}`);
-  console.log(`pawaPay base: ${PAWAPAY_BASE_URL}`);
-});
