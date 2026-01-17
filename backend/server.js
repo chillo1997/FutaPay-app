@@ -236,6 +236,21 @@ app.post("/pawapay/paymentpage/deposit", async (req, res) => {
     return safeJson(res, 400, { ok: false, error: "Missing required fields: amount, phoneNumber" });
   }
 
+  app.get("/pawapay/availability", async (req, res) => {
+  if (!requirePawaPayToken(res)) return;
+
+  const country = req.query.country || "ZMB";
+  const operationType = req.query.operationType || "PAYOUT";
+
+  const result = await pawaPayFetch(
+    `/v2/availability?country=${encodeURIComponent(country)}&operationType=${encodeURIComponent(operationType)}`,
+    { method: "GET" }
+  );
+
+  safeJson(res, result.ok ? 200 : result.status, result);
+});
+
+
   const depositId = crypto.randomUUID();
 
   const payload = {
