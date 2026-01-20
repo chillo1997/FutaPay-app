@@ -129,20 +129,39 @@ app.post("/webhooks/mollie", async (req, res) => {
   try {
     if (!requireMollie(res)) return res.status(200).send("ok");
 
-    const paymentId = req.body?.id;
+    // Mollie sends: id=tr_xxx (urlencoded)
+    const paymentId = req.body?.id || req.query?.id;
+
+    console.log("✅ Mollie webhook hit:", {
+      hasBody: !!req.body,
+      body: req.body,
+      paymentId,
+      ts: new Date().toISOString(),
+    });
+
     if (!paymentId) return res.status(200).send("ok");
 
-    const payment = await mollie.payments.get(paymentId);
+    const payment = await mollie.payments.get(String(paymentId));
+    const status = payment.status;
 
-    const uid = payment?.metadata?.uid;
+    const uid = payment?.metadata?.uid || payment?.metadata?.receiverUid; // ✅ extra safety
     const txId = payment?.metadata?.txId;
+
+    console.log("✅ Mollie payment fetched:", {
+      paymentId: payment.id,
+      status,
+      uid,
+      txId,
+    });
+
     if (!uid || !txId) return res.status(200).send("ok");
 
     const txRef = firestore().doc(`users/${uid}/transactions/${txId}`);
-    const status = payment.status;
 
+    // Map Mollie to app status
     let newStatus = "payment_open";
     if (status === "paid") newStatus = "paid";
+    else if (status === "authorized") newStatus = "paid"; // ✅ treat authorized as paid (optional but solves many cases)
     else if (status === "failed") newStatus = "failed";
     else if (status === "expired") newStatus = "expired";
     else if (status === "canceled") newStatus = "canceled";
@@ -153,17 +172,22 @@ app.post("/webhooks/mollie", async (req, res) => {
         status: newStatus,
         molliePaymentId: payment.id,
         mollieStatus: status,
-        molliePaidAt: status === "paid" ? admin.firestore.FieldValue.serverTimestamp() : null,
+        molliePaidAt:
+          newStatus === "paid" ? admin.firestore.FieldValue.serverTimestamp() : null,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       },
       { merge: true }
     );
 
+    console.log("✅ Firestore updated:", { path: txRef.path, newStatus, mollieStatus: status });
+
     return res.status(200).send("ok");
-  } catch {
+  } catch (err) {
+    console.log("❌ Mollie webhook error:", err?.message || String(err));
     return res.status(200).send("ok");
   }
 });
+
 
 app.get("/mollie/return", (req, res) => {
   res.setHeader("Content-Type", "text/html");
