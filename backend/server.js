@@ -497,6 +497,8 @@ function mapPawaPayStatusToInternal(status) {
 }
 
 app.post("/webhooks/pawapay", async (req, res) => {
+  const db = firestore(); // ✅ single instance for EVERYTHING in this request
+
   try {
     const event = req.body || {};
 
@@ -519,8 +521,7 @@ app.post("/webhooks/pawapay", async (req, res) => {
 
     const internal = mapPawaPayStatusToInternal(status);
 
-    // Find matching transaction across users
-    const snap = await firestore()
+    const snap = await db
       .collectionGroup("transactions")
       .where("pawaPay.payoutId", "==", String(payoutId))
       .limit(5)
@@ -531,16 +532,16 @@ app.post("/webhooks/pawapay", async (req, res) => {
       return res.status(200).send("ok");
     }
 
-    const batch = firestore().batch();
-    for (const doc of snap.docs) {
+    const batch = db.batch(); // ✅ batch from same db instance
+
+    for (const docSnap of snap.docs) {
       batch.set(
-        doc.ref,
+        docSnap.ref,
         {
           status: internal,
-          payoutStatus: internal,
           pawaPay: {
-            ...(doc.data()?.pawaPay || {}),
-            status: String(status),
+            ...(docSnap.data()?.pawaPay || {}),
+            status: String(status),          // raw pawaPay status
             lastCallback: event,
             callbackReceivedAt: admin.firestore.FieldValue.serverTimestamp(),
           },
@@ -551,12 +552,27 @@ app.post("/webhooks/pawapay", async (req, res) => {
     }
 
     await batch.commit();
+
+    console.log("✅ pawaPay webhook Firestore update OK:", {
+      payoutId,
+      status,
+      internal,
+      docs: snap.size,
+    });
+
     return res.status(200).send("ok");
   } catch (err) {
-    console.log("❌ pawaPay webhook error:", err?.message || String(err));
+    // ✅ log full details so we can see if it's an index issue etc.
+    console.log("❌ pawaPay webhook error:", {
+      code: err?.code,
+      message: err?.message,
+      stack: err?.stack,
+    });
+
     return res.status(200).send("ok");
   }
 });
+
 
 /* --------------------------
    Start server
