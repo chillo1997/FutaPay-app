@@ -12,8 +12,7 @@ const app = express();
    Middleware
 -------------------------- */
 app.use(cors());
-// Mollie webhooks often POST as x-www-form-urlencoded, so accept both:
-app.use(express.urlencoded({ extended: false }));
+app.use(express.urlencoded({ extended: false })); // Mollie webhooks often urlencoded
 app.use(express.json({ limit: "1mb" }));
 
 /* --------------------------
@@ -30,7 +29,7 @@ app.get("/health", (req, res) => {
 });
 
 /* --------------------------
-   Firebase Admin (Backend)
+   Firebase Admin
 -------------------------- */
 function initFirebaseAdmin() {
   if (admin.apps.length) return;
@@ -84,11 +83,6 @@ function toMollieValue(amount) {
   return n.toFixed(2);
 }
 
-// ✅ Quick check: is webhook endpoint reachable at all?
-app.get("/webhooks/mollie", (req, res) => {
-  res.status(200).json({ ok: true, note: "Mollie webhook endpoint reachable (GET test)" });
-});
-
 // Create Mollie payment
 app.post("/mollie/payments", async (req, res) => {
   try {
@@ -116,7 +110,6 @@ app.post("/mollie/payments", async (req, res) => {
       description: description || "FutaPay transfer",
       redirectUrl: redirectUrl || `${PUBLIC_BASE_URL}/mollie/return`,
       webhookUrl: `${PUBLIC_BASE_URL}/webhooks/mollie`,
-      // ✅ always store txId (normalized key)
       metadata: { ...metadata, uid, txId },
     });
 
@@ -135,7 +128,6 @@ app.post("/webhooks/mollie", async (req, res) => {
   try {
     if (!requireMollie(res)) return res.status(200).send("ok");
 
-    // Mollie sends: id=tr_xxx (urlencoded)
     const paymentId = req.body?.id || req.query?.id;
 
     console.log("✅ Mollie webhook hit:", {
@@ -152,29 +144,25 @@ app.post("/webhooks/mollie", async (req, res) => {
 
     const uid = payment?.metadata?.uid;
     const txId = payment?.metadata?.txId || payment?.metadata?.txid;
-
-    console.log("✅ Mollie payment fetched:", {
-      paymentId: payment.id,
-      status,
-      uid,
-      txId,
-    });
-
     if (!uid || !txId) return res.status(200).send("ok");
+
+    console.log("✅ Mollie payment fetched:", { paymentId: payment.id, status, uid, txId });
 
     const txRef = firestore().doc(`users/${uid}/transactions/${txId}`);
 
-    // Map Mollie to app status
     let newStatus = "payment_open";
-    if (status === "paid" || status === "authorized") newStatus = "paid";
+    if (status === "paid") newStatus = "paid";
+    else if (status === "authorized") newStatus = "paid"; // optional
     else if (status === "failed") newStatus = "failed";
     else if (status === "expired") newStatus = "expired";
     else if (status === "canceled") newStatus = "canceled";
     else if (status === "pending") newStatus = "pending";
 
+    // ✅ Keep status as payment pipeline status
     await txRef.set(
       {
         status: newStatus,
+        paymentStatus: newStatus,
         molliePaymentId: payment.id,
         mollieStatus: status,
         molliePaidAt: newStatus === "paid" ? admin.firestore.FieldValue.serverTimestamp() : null,
@@ -186,52 +174,8 @@ app.post("/webhooks/mollie", async (req, res) => {
     console.log("✅ Firestore updated:", { path: txRef.path, newStatus, mollieStatus: status });
     return res.status(200).send("ok");
   } catch (err) {
-    console.log("❌ Mollie webhook error:", err?.stack || err?.message || String(err));
-    // Still ACK so Mollie doesn't keep retrying forever
+    console.log("❌ Mollie webhook error:", err?.message || String(err));
     return res.status(200).send("ok");
-  }
-});
-
-// ✅ Manual reconcile endpoint (fix stuck payments on demand)
-app.post("/mollie/reconcile", async (req, res) => {
-  try {
-    if (!requireMollie(res)) return;
-
-    const { paymentId } = req.body || {};
-    if (!paymentId) return res.status(400).json({ ok: false, error: "paymentId required" });
-
-    const payment = await mollie.payments.get(String(paymentId));
-    const status = payment.status;
-
-    const uid = payment?.metadata?.uid;
-    const txId = payment?.metadata?.txId || payment?.metadata?.txid;
-    if (!uid || !txId) {
-      return res.status(400).json({ ok: false, error: "Missing uid/txId in Mollie metadata" });
-    }
-
-    const txRef = firestore().doc(`users/${uid}/transactions/${txId}`);
-
-    let newStatus = "payment_open";
-    if (status === "paid" || status === "authorized") newStatus = "paid";
-    else if (status === "failed") newStatus = "failed";
-    else if (status === "expired") newStatus = "expired";
-    else if (status === "canceled") newStatus = "canceled";
-    else if (status === "pending") newStatus = "pending";
-
-    await txRef.set(
-      {
-        status: newStatus,
-        molliePaymentId: payment.id,
-        mollieStatus: status,
-        molliePaidAt: newStatus === "paid" ? admin.firestore.FieldValue.serverTimestamp() : null,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
-
-    return res.json({ ok: true, newStatus, mollieStatus: status, uid, txId });
-  } catch (err) {
-    return res.status(500).json({ ok: false, error: err?.message || String(err) });
   }
 });
 
@@ -295,47 +239,67 @@ function safeJson(res, status, payload) {
   res.status(status).json(payload);
 }
 
+function sanitizeMsisdn(phone) {
+  // pawaPay accepts digits (no '+'), predict-provider also returns digits
+  const s = String(phone || "").trim();
+  if (!s) return "";
+  return s.replace(/[^\d]/g, "");
+}
+
+function looksLikeProviderCode(provider) {
+  // e.g. MTN_MOMO_ZMB
+  const s = String(provider || "").trim();
+  return /^[A-Z0-9_]+$/.test(s) && /_[A-Z]{3}$/.test(s);
+}
+
+async function predictProvider(phoneNumber) {
+  // pawaPay Predict Provider endpoint (POST /v2/predict-provider) :contentReference[oaicite:2]{index=2}
+  const result = await pawaPayFetch("/v2/predict-provider", {
+    method: "POST",
+    body: { phoneNumber: String(phoneNumber) },
+  });
+
+  if (!result.ok) return { ok: false, result };
+
+  return {
+    ok: true,
+    countryIso3: result.data?.country,
+    providerCode: result.data?.provider,
+    msisdnDigits: result.data?.phoneNumber, // digits string
+    raw: result.data,
+  };
+}
+
 /**
- * Optional: see what pawaPay thinks is available (often useful in sandbox).
- * Example:
- * /pawapay/availability?country=ZMB&operationType=PAYOUT
+ * Optional debug endpoints
  */
 app.get("/pawapay/availability", async (req, res) => {
   if (!requirePawaPayToken(res)) return;
-
   const country = req.query.country || "ZMB";
   const operationType = req.query.operationType || "PAYOUT";
-
   const result = await pawaPayFetch(
-    `/v2/availability?country=${encodeURIComponent(country)}&operationType=${encodeURIComponent(
-      operationType
-    )}`,
+    `/v2/availability?country=${encodeURIComponent(country)}&operationType=${encodeURIComponent(operationType)}`,
     { method: "GET" }
   );
-
   safeJson(res, result.ok ? 200 : result.status, result);
 });
 
-// Active configuration
 app.get("/pawapay/active-conf", async (req, res) => {
   if (!requirePawaPayToken(res)) return;
   const result = await pawaPayFetch("/v2/active-configuration", { method: "GET" });
   safeJson(res, result.ok ? 200 : result.status, result);
 });
 
-// Payment page deposit (if you use it)
+// Payment page deposit (optional)
 app.post("/pawapay/paymentpage/deposit", async (req, res) => {
   if (!requirePawaPayToken(res)) return;
 
-  const { amount, currency = "ZMW", customerMessage = "FutaPay test", phoneNumber, returnUrl } =
-    req.body || {};
-
+  const { amount, currency = "ZMW", customerMessage = "FutaPay test", phoneNumber, returnUrl } = req.body || {};
   if (!amount || !phoneNumber) {
     return safeJson(res, 400, { ok: false, error: "Missing required fields: amount, phoneNumber" });
   }
 
   const depositId = crypto.randomUUID();
-
   const payload = {
     depositId,
     amount: String(amount),
@@ -348,11 +312,7 @@ app.post("/pawapay/paymentpage/deposit", async (req, res) => {
   const result = await pawaPayFetch("/payment-page/deposits", { method: "POST", body: payload });
 
   if (!result.ok) {
-    return safeJson(res, result.status, {
-      ok: false,
-      error: "pawaPay deposit creation failed",
-      details: result.data,
-    });
+    return safeJson(res, result.status, { ok: false, error: "pawaPay deposit creation failed", details: result.data });
   }
 
   const redirectUrl =
@@ -364,7 +324,6 @@ app.post("/pawapay/paymentpage/deposit", async (req, res) => {
   return safeJson(res, 200, { ok: true, depositId, redirectUrl, raw: result.data });
 });
 
-// Return page for payment page deposits
 app.get("/pawapay/return", (req, res) => {
   res.setHeader("Content-Type", "text/html");
   res.end(`
@@ -382,25 +341,43 @@ app.post("/pawapay/payouts", async (req, res) => {
   const {
     uid,
     txId,
-    provider,
+    provider, // can be LABEL ("MTN MoMo") OR CODE ("MTN_MOMO_ZMB")
     phoneNumber,
     amount,
     currency = "ZMW",
     customerMessage = "FutaPay payout test",
   } = req.body || {};
 
-  if (!uid || !txId) {
-    return safeJson(res, 400, { ok: false, error: "Missing required fields: uid, txId" });
-  }
-
-  if (!provider || !phoneNumber || !amount) {
-    return safeJson(res, 400, {
-      ok: false,
-      error: "Missing required fields: provider, phoneNumber, amount",
-    });
+  if (!uid || !txId) return safeJson(res, 400, { ok: false, error: "Missing required fields: uid, txId" });
+  if (!phoneNumber || !amount) {
+    return safeJson(res, 400, { ok: false, error: "Missing required fields: phoneNumber, amount" });
   }
 
   const payoutId = crypto.randomUUID();
+
+  // ✅ Resolve provider code + sanitized msisdn
+  let providerCode = String(provider || "").trim();
+  let msisdnDigits = sanitizeMsisdn(phoneNumber);
+
+  if (!looksLikeProviderCode(providerCode)) {
+    const pred = await predictProvider(phoneNumber);
+    if (pred.ok) {
+      providerCode = pred.providerCode; // e.g. MTN_MOMO_ZMB :contentReference[oaicite:3]{index=3}
+      msisdnDigits = pred.msisdnDigits || msisdnDigits;
+      console.log("✅ pawaPay predict-provider used:", {
+        input: phoneNumber,
+        providerCode,
+        msisdnDigits,
+        countryIso3: pred.countryIso3,
+      });
+    } else {
+      console.log("⚠️ predict-provider failed, will try provided provider as-is:", pred?.result?.data);
+    }
+  }
+
+  if (!providerCode) {
+    return safeJson(res, 400, { ok: false, error: "Missing/invalid provider. Provide provider code or a valid phoneNumber." });
+  }
 
   const payload = {
     payoutId,
@@ -408,21 +385,27 @@ app.post("/pawapay/payouts", async (req, res) => {
     currency,
     recipient: {
       type: "MMO",
-      accountDetails: { provider, phoneNumber: String(phoneNumber) },
+      accountDetails: {
+        provider: providerCode,
+        phoneNumber: String(msisdnDigits), // digits no '+'
+      },
     },
     customerMessage,
   };
 
+  // Initiate payout :contentReference[oaicite:4]{index=4}
   const result = await pawaPayFetch("/v2/payouts", { method: "POST", body: payload });
 
-  // Store request + response in Firestore (so we can track it later)
   const txRef = firestore().doc(`users/${uid}/transactions/${txId}`);
 
-  // Always store the payoutId even if pawaPay errors, for debugging
+  // ✅ Store payout info WITHOUT overwriting payment status
   await txRef.set(
     {
+      payoutStatus: result.ok ? "REQUEST_ACCEPTED" : "REQUEST_FAILED",
       pawaPay: {
         payoutId,
+        providerUsed: providerCode,
+        phoneNumberUsed: String(msisdnDigits),
         request: payload,
         lastResponse: result.data,
         lastHttpStatus: result.status,
@@ -439,10 +422,17 @@ app.post("/pawapay/payouts", async (req, res) => {
       error: "pawaPay payout creation failed",
       details: result.data,
       payoutId,
+      providerUsed: providerCode,
     });
   }
 
-  return safeJson(res, 200, { ok: true, payoutId, raw: result.data });
+  return safeJson(res, 200, {
+    ok: true,
+    payoutId,
+    providerUsed: providerCode,
+    phoneNumberUsed: String(msisdnDigits),
+    raw: result.data,
+  });
 });
 
 /* --------------------------
@@ -451,11 +441,11 @@ app.post("/pawapay/payouts", async (req, res) => {
 function mapPawaPayStatusToInternal(status) {
   const s = String(status || "").toUpperCase();
 
-  if (["ACCEPTED", "ENQUEUED", "PENDING", "PROCESSING"].includes(s)) return "payout_processing";
-  if (["COMPLETED", "SUCCESSFUL", "SUCCESS"].includes(s)) return "payout_completed";
-  if (["FAILED", "REJECTED", "CANCELLED", "CANCELED", "EXPIRED"].includes(s)) return "payout_failed";
+  if (["ACCEPTED", "ENQUEUED", "PENDING", "PROCESSING"].includes(s)) return "PROCESSING";
+  if (["COMPLETED", "SUCCESSFUL", "SUCCESS"].includes(s)) return "COMPLETED";
+  if (["FAILED", "REJECTED", "CANCELLED", "CANCELED", "EXPIRED"].includes(s)) return "FAILED";
 
-  return "payout_unknown";
+  return "UNKNOWN";
 }
 
 app.post("/webhooks/pawapay", async (req, res) => {
@@ -479,7 +469,7 @@ app.post("/webhooks/pawapay", async (req, res) => {
     // Always ACK quickly
     if (!payoutId || !status) return res.status(200).send("ok");
 
-    const internal = mapPawaPayStatusToInternal(status);
+    const payoutState = mapPawaPayStatusToInternal(status);
 
     const snap = await firestore()
       .collectionGroup("transactions")
@@ -493,13 +483,14 @@ app.post("/webhooks/pawapay", async (req, res) => {
     }
 
     const batch = firestore().batch();
-    for (const docSnap of snap.docs) {
+    for (const doc of snap.docs) {
       batch.set(
-        docSnap.ref,
+        doc.ref,
         {
-          status: internal,
+          // ✅ DON'T overwrite payment status field here
+          payoutStatus: payoutState, // COMPLETED / FAILED / PROCESSING / UNKNOWN
           pawaPay: {
-            ...(docSnap.data()?.pawaPay || {}),
+            ...(doc.data()?.pawaPay || {}),
             status: String(status),
             lastCallback: event,
             callbackReceivedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -513,15 +504,15 @@ app.post("/webhooks/pawapay", async (req, res) => {
     await batch.commit();
     return res.status(200).send("ok");
   } catch (err) {
-    console.log("❌ pawaPay webhook error:", err?.stack || err?.message || String(err));
+    console.log("❌ pawaPay webhook error:", err?.message || String(err));
     return res.status(200).send("ok");
   }
 });
 
 /* --------------------------
-   Start server
+   Start
 -------------------------- */
 app.listen(PORT, () => {
-  console.log(`✅ Server listening on port ${PORT}`);
-  console.log(`✅ PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}`);
+  console.log(`✅ Server running on port ${PORT}`);
+  console.log(`✅ Public base URL: ${PUBLIC_BASE_URL}`);
 });
